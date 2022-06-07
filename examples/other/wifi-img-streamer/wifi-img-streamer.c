@@ -64,6 +64,21 @@ static uint32_t transferTime = 0;
 static uint32_t encodingTime = 0;
 #define OUTPUT_PROFILING_DATA
 
+// #define MANUAL_EXPOSURE
+
+static void set_register(uint32_t reg_addr, uint8_t value)
+{
+  uint8_t set_value = value;
+  // uint8_t get_value;
+  pi_camera_reg_set(&camera, reg_addr, &set_value);
+  // pi_time_wait_us(1000000);
+  // pi_camera_reg_get(&camera, reg_addr, &get_value);
+  // if (set_value != get_value)
+  // {
+  //   cpxPrintToConsole(LOG_TO_CRTP, "Failed to set camera register %d\n", reg_addr);
+  // }
+}
+
 static int open_pi_camera_himax(struct pi_device *device)
 {
   struct pi_himax_conf cam_conf;
@@ -76,27 +91,31 @@ static int open_pi_camera_himax(struct pi_device *device)
   if (pi_camera_open(device))
     return -1;
 
+
   // rotate image
-  pi_camera_control(&camera, PI_CAMERA_CMD_START, 0);
-  uint8_t set_value = 3; 
-  uint8_t reg_value;
-  pi_camera_reg_set(&camera, IMG_ORIENTATION, &set_value);
-  pi_time_wait_us(1000000);
-  pi_camera_reg_get(&camera, IMG_ORIENTATION, &reg_value);
-  if (set_value != reg_value)
-  {
-    cpxPrintToConsole(LOG_TO_CRTP, "Failed to rotate camera image\n");
-    return -1;
-  }
+  set_register(IMG_ORIENTATION, 3);
 
-  // SDK uses 0x0B by default, i.e., vt_reg_div=1 and vt_sys_div=1
-  //set_value = 
-  //pi_camera_reg_set(&camera, /*HIMAX_OSC_CLK_DIV*/0x3060, &set_value);
+  // Use the following, to disable all automatic blocks
+  // set_register(0x0601, 0x0);
+  // set_register(0x1000, 0x0);
+  // set_register(0x1006, 0x0);
+  // set_register(0x1008, 0x0);
+  // set_register(0x2000, 0x0);
+  // set_register(0x2100, 0x0);  // AE_CTRL -> disable automatic exposure
+  // set_register(0x2150, 0x0);
 
+  // // Use the following for automatic flicker control
+  // set_register(0x2100, 0x1);  // AE_CTRL
+  // set_register(0x210E, 0x3);  // FS_CTRL
+  // set_register(0x210F, 0);    // FS_60HZ_H
+  // set_register(0x2110, 0x42); // FS_60HZ_L
 
-  pi_camera_control(&camera, PI_CAMERA_CMD_STOP, 0);
+#ifdef MANUAL_EXPOSURE
+  set_register(0x2100, 0x0);  // AE_CTRL -> disable automatic exposure
+#endif
 
-  pi_camera_control(device, PI_CAMERA_CMD_AEG_INIT, 0);
+  // This is needed for the camera to actually update its registers.
+  set_register(0x0104, 0x1);
 
   return 0;
 }
@@ -354,6 +373,10 @@ void camera_task(void *parameters)
 
   uint32_t imgSize = 0;
 
+#ifdef MANUAL_EXPOSURE
+  uint16_t exposure = 2;
+#endif
+
   StatePacket_t cf_state;
   cpxPrintToConsole(LOG_TO_CRTP, "Camera ready!\n");
   while (1)
@@ -368,6 +391,20 @@ void camera_task(void *parameters)
       // For full resulution, we have min_line_length_pck=0x0178 and min_frame_length_lines=0x0158
       // This would result in 23 fps
 
+
+#ifdef MANUAL_EXPOSURE
+      cpxPrintToConsole(LOG_TO_CRTP, "exposure %d\n", exposure);
+
+      set_register(0x0202, (exposure >> 8) & 0xFF);    // INTEGRATION_H
+      set_register(0x0203, exposure & 0xFF);    // INTEGRATION_L
+      set_register(0x0104, 0x1);
+      exposure += 50;
+
+      // needs to be between [2, frame_length_lines - 2]
+      if (exposure > 0x0216 - 2) {
+        exposure = 2;
+      }
+#endif
 
       start = xTaskGetTickCount();
       pi_camera_capture_async(&camera, imgBuff1, resolution, pi_task_callback(&task1, capture_done_cb, &task1));
