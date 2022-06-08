@@ -50,6 +50,7 @@ static unsigned char *imgBuff3;
 static pi_buffer_t buffer3;
 
 static struct pi_device camera;
+static struct pi_device uart;
 
 static EventGroupHandle_t evGroup;
 #define CAPTURE_DONE_BIT (1 << 0)
@@ -62,7 +63,7 @@ static uint32_t captureTime2 = 0;
 static uint32_t captureTime3 = 0;
 static uint32_t transferTime = 0;
 static uint32_t encodingTime = 0;
-#define OUTPUT_PROFILING_DATA
+// #define OUTPUT_PROFILING_DATA
 
 // #define MANUAL_EXPOSURE
 
@@ -164,25 +165,104 @@ void rx_task(void *parameters)
   }
 }
 
-void rx_task_app(void *parameters)
+// void rx_task_app(void *parameters)
+// {
+//   uint64_t last_timestamp = 0;
+
+//   while (1)
+//   {
+//     cpxReceivePacketBlocking(CPX_F_APP, &rxp_app);
+//     // put the state in the thread-safe queue
+//     xQueueOverwrite(stateQueue, rxp_app.data);
+
+//     // Detect a clock synchronization event:
+//     // The clock on the STM was synchronized (== reset to 0) using a broadcast
+//     // if the current timestamp is smaller than the previous timestamp, since
+//     // timestamps can only increment otherwise.
+//     const StatePacket_t* cf_state = (const StatePacket_t*)rxp_app.data;
+//     if (last_timestamp == 0 || cf_state->timestamp < last_timestamp) {
+//       stmStart = xTaskGetTickCount();
+//     }
+//     last_timestamp = cf_state->timestamp;
+//   }
+// }
+
+static uint8_t uart_buffer[50];
+void uart_rx_task(void *parameters)
 {
   uint64_t last_timestamp = 0;
+  bool synchronized = false;
 
   while (1)
   {
-    cpxReceivePacketBlocking(CPX_F_APP, &rxp_app);
-    // put the state in the thread-safe queue
-    xQueueOverwrite(stateQueue, rxp_app.data);
+    if (!synchronized) {
+      uint8_t dummy;
 
-    // Detect a clock synchronization event:
-    // The clock on the STM was synchronized (== reset to 0) using a broadcast
-    // if the current timestamp is smaller than the previous timestamp, since
-    // timestamps can only increment otherwise.
-    const StatePacket_t* cf_state = (const StatePacket_t*)rxp_app.data;
-    if (last_timestamp == 0 || cf_state->timestamp < last_timestamp) {
-      stmStart = xTaskGetTickCount();
+      if (0 == pi_uart_read(&uart, &dummy, 1)) {
+        // wait for the magic start
+        if (dummy == 0xBC) {
+          // next one should be the length
+          if (0 == pi_uart_read(&uart, &dummy, 1)) {
+            uint8_t length = dummy;
+            // now read length + 1 and verify that the CRC matches
+            if (length < sizeof(uart_buffer) - 1) {
+              if (0 == pi_uart_read(&uart, &uart_buffer, length+1)) {
+                // compute crc
+                uint8_t crc = 0;
+                for (const uint8_t* p = uart_buffer; p < uart_buffer+length; p++) {
+                  crc ^= *p;
+                }
+                // verify crc
+                if (uart_buffer[length] == crc) {
+                  synchronized = true;
+                  cpxPrintToConsole(LOG_TO_CRTP, "UART Synced\n");
+                }
+              }
+            }
+          }
+        }
+      }
+    } else {
+      if (0 == pi_uart_read(&uart, uart_buffer, 2+sizeof(StatePacket_t)+1)) {
+        if (uart_buffer[0] == 0xBC && uart_buffer[1] == sizeof(StatePacket_t)) {
+          // compute crc
+          uint8_t crc = 0;
+          for (const uint8_t* p = uart_buffer + 2; p < uart_buffer+2+sizeof(StatePacket_t); p++) {
+            crc ^= *p;
+          }
+          // verify crc
+          if (uart_buffer[2+sizeof(StatePacket_t)] == crc) {
+
+            const StatePacket_t* cf_state = (const StatePacket_t*)&uart_buffer[2];
+
+            // put the state in the thread-safe queue
+            xQueueOverwrite(stateQueue, cf_state);
+
+            // Detect a clock synchronization event:
+            // The clock on the STM was synchronized (== reset to 0) using a broadcast
+            // if the current timestamp is smaller than the previous timestamp, since
+            // timestamps can only increment otherwise.
+            if (last_timestamp == 0 || cf_state->timestamp < last_timestamp) {
+              stmStart = xTaskGetTickCount();
+              cpxPrintToConsole(LOG_TO_CRTP, "TimeSync %u %u\n", (unsigned int)cf_state->timestamp, (unsigned int)last_timestamp);
+
+            }
+            last_timestamp = cf_state->timestamp;
+
+
+          } else {
+            synchronized = false;
+            cpxPrintToConsole(LOG_TO_CRTP, "UART Not Synced - 1\n");
+          }
+        } else {
+          synchronized = false;
+          cpxPrintToConsole(LOG_TO_CRTP, "UART Not Synced - 2\n");
+        }
+      } else {
+        synchronized = false;
+        cpxPrintToConsole(LOG_TO_CRTP, "UART Not Synced - 3\n");
+      }
     }
-    last_timestamp = cf_state->timestamp;
   }
 }
 
@@ -518,12 +598,11 @@ void hb_task(void *parameters)
 void start_example(void)
 {
   struct pi_uart_conf conf;
-  struct pi_device device;
   pi_uart_conf_init(&conf);
   conf.baudrate_bps = 115200;
 
-  pi_open_from_conf(&device, &conf);
-  if (pi_uart_open(&device))
+  pi_open_from_conf(&uart, &conf);
+  if (pi_uart_open(&uart))
   {
     printf("[UART] open failed !\n");
     pmsis_exit(-1);
@@ -568,12 +647,21 @@ void start_example(void)
     pmsis_exit(-1);
   }
 
-  xTask = xTaskCreate(rx_task_app, "rx_task_app", configMINIMAL_STACK_SIZE * 2,
+  // xTask = xTaskCreate(rx_task_app, "rx_task_app", configMINIMAL_STACK_SIZE * 2,
+  //                     NULL, tskIDLE_PRIORITY + 1, NULL);
+
+  // if (xTask != pdPASS)
+  // {
+  //   cpxPrintToConsole(LOG_TO_CRTP, "RX app task did not start !\n");
+  //   pmsis_exit(-1);
+  // }
+
+  xTask = xTaskCreate(uart_rx_task, "uart_rx_task", configMINIMAL_STACK_SIZE * 2,
                       NULL, tskIDLE_PRIORITY + 1, NULL);
 
   if (xTask != pdPASS)
   {
-    cpxPrintToConsole(LOG_TO_CRTP, "RX app task did not start !\n");
+    cpxPrintToConsole(LOG_TO_CRTP, "UART RX task did not start !\n");
     pmsis_exit(-1);
   }
 
