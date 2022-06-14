@@ -140,6 +140,11 @@ typedef struct
     uint16_t exposure;
 } __attribute__((packed)) RegisterPacket_t;
 
+
+static StatePacket_t cf_state1;
+static StatePacket_t cf_state2;
+static StatePacket_t cf_state3;
+
 static QueueHandle_t stateQueue;
 
 void rx_task(void *parameters)
@@ -298,13 +303,19 @@ static void capture_done_cb(void *arg)
 {
   if (arg == &task1) {
     captureTime1 = xTaskGetTickCount() - stmStart;
+    // get the current state from the STM
+    xQueuePeek(stateQueue, &cf_state1, 0);
   }
   if (arg == &task2) {
     captureTime2 = xTaskGetTickCount() - stmStart;
+    // get the current state from the STM
+    xQueuePeek(stateQueue, &cf_state2, 0);
   }
   if (arg == &task3) {
     captureTime3 = xTaskGetTickCount() - stmStart;
     xEventGroupSetBits(evGroup, CAPTURE_DONE_BIT);
+    // get the current state from the STM
+    xQueuePeek(stateQueue, &cf_state3, 0);
   }
 }
 
@@ -481,7 +492,6 @@ void camera_task(void *parameters)
 
   uint32_t imgSize = 0;
 
-  StatePacket_t cf_state;
   cpxPrintToConsole(LOG_TO_CRTP, "Camera ready!\n");
   while (1)
   {
@@ -505,9 +515,6 @@ void camera_task(void *parameters)
       xEventGroupWaitBits(evGroup, CAPTURE_DONE_BIT, pdTRUE, pdFALSE, (TickType_t)portMAX_DELAY);
       pi_camera_control(&camera, PI_CAMERA_CMD_STOP, 0);
 
-      // get the current state from the STM
-      xQueuePeek(stateQueue, &cf_state, 0);
-
       if (streamerMode == JPEG_ENCODING)
       {
         //jpeg_encoder_process_async(&jpeg_encoder, &buffer, &jpeg_data, pi_task_callback(&task1, encoding_done_cb, NULL));
@@ -520,7 +527,7 @@ void camera_task(void *parameters)
         imgSize = headerSize + jpegSize + footerSize;
 
         // First send information about the image
-        createImageHeaderPacket(&txp, imgSize, JPEG_ENCODING, &cf_state, captureTime1);
+        createImageHeaderPacket(&txp, imgSize, JPEG_ENCODING, &cf_state1, captureTime1);
         cpxSendPacketBlocking(&txp);
 
         start = xTaskGetTickCount();
@@ -545,7 +552,7 @@ void camera_task(void *parameters)
         start = xTaskGetTickCount();
 
         // First send information about the image
-        createImageHeaderPacket(&txp, imgSize, RAW_ENCODING, &cf_state, captureTime1);
+        createImageHeaderPacket(&txp, imgSize, RAW_ENCODING, &cf_state1, captureTime1);
         cpxSendPacketBlocking(&txp);
 
         // Send image
@@ -555,7 +562,7 @@ void camera_task(void *parameters)
         // second buffer
 
         // First send information about the image
-        createImageHeaderPacket(&txp, imgSize, RAW_ENCODING, &cf_state, captureTime2);
+        createImageHeaderPacket(&txp, imgSize, RAW_ENCODING, &cf_state2, captureTime2);
         cpxSendPacketBlocking(&txp);
 
         // Send image
@@ -565,7 +572,7 @@ void camera_task(void *parameters)
         // third buffer 
 
         // First send information about the image
-        createImageHeaderPacket(&txp, imgSize, RAW_ENCODING, &cf_state, captureTime3);
+        createImageHeaderPacket(&txp, imgSize, RAW_ENCODING, &cf_state3, captureTime3);
         cpxSendPacketBlocking(&txp);
 
         // Send image
