@@ -65,8 +65,6 @@ static uint32_t transferTime = 0;
 static uint32_t encodingTime = 0;
 // #define OUTPUT_PROFILING_DATA
 
-// #define MANUAL_EXPOSURE
-
 static void set_register(uint32_t reg_addr, uint8_t value)
 {
   uint8_t set_value = value;
@@ -111,10 +109,6 @@ static int open_pi_camera_himax(struct pi_device *device)
   // set_register(0x210F, 0);    // FS_60HZ_H
   // set_register(0x2110, 0x42); // FS_60HZ_L
 
-#ifdef MANUAL_EXPOSURE
-  set_register(0x2100, 0x0);  // AE_CTRL -> disable automatic exposure
-#endif
-
   // This is needed for the camera to actually update its registers.
   set_register(0x0104, 0x1);
 
@@ -136,6 +130,16 @@ typedef struct
   int16_t z;  // compressed [mm]
   uint32_t quat; // compressed, see quatcompress.h
 } __attribute__((packed)) StatePacket_t;
+
+typedef struct
+{
+    uint8_t cmd;
+    uint8_t aeg;
+    uint8_t aGain;
+    uint8_t dGain;
+    uint16_t exposure;
+} __attribute__((packed)) RegisterPacket_t;
+
 
 static StatePacket_t cf_state1;
 static StatePacket_t cf_state2;
@@ -169,27 +173,52 @@ void rx_task(void *parameters)
   }
 }
 
-// void rx_task_app(void *parameters)
-// {
-//   uint64_t last_timestamp = 0;
+void rx_task_app(void *parameters)
+{
+  while (1)
+  {
+    cpxReceivePacketBlocking(CPX_F_APP, &rxp_app);
 
-//   while (1)
-//   {
-//     cpxReceivePacketBlocking(CPX_F_APP, &rxp_app);
-//     // put the state in the thread-safe queue
-//     xQueueOverwrite(stateQueue, rxp_app.data);
+    const RegisterPacket_t* regs = (const RegisterPacket_t*)rxp_app.data;
+    if (rxp_app.dataLength == sizeof(RegisterPacket_t) && regs->cmd == 0) {
 
-//     // Detect a clock synchronization event:
-//     // The clock on the STM was synchronized (== reset to 0) using a broadcast
-//     // if the current timestamp is smaller than the previous timestamp, since
-//     // timestamps can only increment otherwise.
-//     const StatePacket_t* cf_state = (const StatePacket_t*)rxp_app.data;
-//     if (last_timestamp == 0 || cf_state->timestamp < last_timestamp) {
-//       stmStart = xTaskGetTickCount();
-//     }
-//     last_timestamp = cf_state->timestamp;
-//   }
-// }
+
+      set_register(0x2100, regs->aeg);  // AE_CTRL
+
+      switch(regs->aGain) {
+        case 8:
+          set_register(0x0205, 0x30);
+          break;
+        case 4:
+          set_register(0x0205, 0x20);
+          break;
+        case 2:
+          set_register(0x0205, 0x10);
+          break;
+        case 1:
+        default:
+          set_register(0x0205, 0x00);
+          break;
+      }
+
+      set_register(0x020E, (regs->dGain >> 6)); // 2.6 int part
+      set_register(0x020F, regs->dGain & 0x3F); // 2.6 float part
+
+      uint16_t exposure = regs->exposure;
+      if (exposure < 2) {
+        exposure = 2;
+      }
+      if (exposure > 0x0216 - 2) {
+        exposure = 0x0216 - 2;
+      }
+      set_register(0x0202, (exposure >> 8) & 0xFF);    // INTEGRATION_H
+      set_register(0x0203, exposure & 0xFF);    // INTEGRATION_L
+
+      // This is needed for the camera to actually update its registers.
+      set_register(0x0104, 0x1);
+    }
+  }
+}
 
 static uint8_t uart_buffer[50];
 void uart_rx_task(void *parameters)
@@ -463,10 +492,6 @@ void camera_task(void *parameters)
 
   uint32_t imgSize = 0;
 
-#ifdef MANUAL_EXPOSURE
-  uint16_t exposure = 2;
-#endif
-
   cpxPrintToConsole(LOG_TO_CRTP, "Camera ready!\n");
   while (1)
   {
@@ -480,20 +505,6 @@ void camera_task(void *parameters)
       // For full resulution, we have min_line_length_pck=0x0178 and min_frame_length_lines=0x0158
       // This would result in 23 fps
 
-
-#ifdef MANUAL_EXPOSURE
-      cpxPrintToConsole(LOG_TO_CRTP, "exposure %d\n", exposure);
-
-      set_register(0x0202, (exposure >> 8) & 0xFF);    // INTEGRATION_H
-      set_register(0x0203, exposure & 0xFF);    // INTEGRATION_L
-      set_register(0x0104, 0x1);
-      exposure += 50;
-
-      // needs to be between [2, frame_length_lines - 2]
-      if (exposure > 0x0216 - 2) {
-        exposure = 2;
-      }
-#endif
 
       start = xTaskGetTickCount();
       pi_camera_capture_async(&camera, imgBuff1, resolution, pi_task_callback(&task1, capture_done_cb, &task1));
@@ -653,14 +664,14 @@ void start_example(void)
     pmsis_exit(-1);
   }
 
-  // xTask = xTaskCreate(rx_task_app, "rx_task_app", configMINIMAL_STACK_SIZE * 2,
-  //                     NULL, tskIDLE_PRIORITY + 1, NULL);
+  xTask = xTaskCreate(rx_task_app, "rx_task_app", configMINIMAL_STACK_SIZE * 2,
+                      NULL, tskIDLE_PRIORITY + 1, NULL);
 
-  // if (xTask != pdPASS)
-  // {
-  //   cpxPrintToConsole(LOG_TO_CRTP, "RX app task did not start !\n");
-  //   pmsis_exit(-1);
-  // }
+  if (xTask != pdPASS)
+  {
+    cpxPrintToConsole(LOG_TO_CRTP, "RX app task did not start !\n");
+    pmsis_exit(-1);
+  }
 
   xTask = xTaskCreate(uart_rx_task, "uart_rx_task", configMINIMAL_STACK_SIZE * 2,
                       NULL, tskIDLE_PRIORITY + 1, NULL);
