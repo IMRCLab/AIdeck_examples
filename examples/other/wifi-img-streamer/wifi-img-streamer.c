@@ -28,6 +28,7 @@
 #include "bsp/bsp.h"
 #include "bsp/camera/himax.h"
 #include "bsp/buffer.h"
+#include <bsp/flash/hyperflash.h>
 #include "gaplib/jpeg_encoder.h"
 #include "stdio.h"
 
@@ -39,10 +40,14 @@
 // #define CAM_HEIGHT 244
 #define CAM_HEIGHT 324
 
+#define MAX_FLASH_STORAGE (1024*1024*4)
+
 static pi_task_t task1;
+static pi_task_t task1flash;
 static unsigned char *imgBuff1;
 static pi_buffer_t buffer1;
 static pi_task_t task2;
+static pi_task_t task2flash;
 static unsigned char *imgBuff2;
 static pi_buffer_t buffer2;
 static pi_task_t task3;
@@ -51,6 +56,19 @@ static pi_buffer_t buffer3;
 
 static struct pi_device camera;
 static struct pi_device uart;
+
+// HyperFlash
+static struct pi_device flash;
+static struct pi_hyperflash_conf flash_conf;
+
+// HyperRAM
+static struct pi_device ram;
+static struct pi_hyperram_conf ram_conf;
+static uint32_t ram_buffer;
+static uint32_t ram_buffer_end;
+
+static uint32_t flash_end;
+static uint32_t flash_offset;
 
 static EventGroupHandle_t evGroup;
 #define CAPTURE_DONE_BIT (1 << 0)
@@ -303,21 +321,71 @@ static void capture_done_cb(void *arg)
 {
   if (arg == &task1) {
     captureTime1 = xTaskGetTickCount() - stmStart;
+    xEventGroupSetBits(evGroup, CAPTURE_DONE_BIT);
     // get the current state from the STM
     xQueuePeek(stateQueue, &cf_state1, 0);
   }
-  if (arg == &task2) {
-    captureTime2 = xTaskGetTickCount() - stmStart;
-    // get the current state from the STM
-    xQueuePeek(stateQueue, &cf_state2, 0);
-  }
-  if (arg == &task3) {
-    captureTime3 = xTaskGetTickCount() - stmStart;
-    xEventGroupSetBits(evGroup, CAPTURE_DONE_BIT);
-    // get the current state from the STM
-    xQueuePeek(stateQueue, &cf_state3, 0);
+  // if (arg == &task2) {
+  //   captureTime2 = xTaskGetTickCount() - stmStart;
+  //   // get the current state from the STM
+  //   xQueuePeek(stateQueue, &cf_state2, 0);
+  // }
+  // if (arg == &task3) {
+  //   captureTime3 = xTaskGetTickCount() - stmStart;
+  //   xEventGroupSetBits(evGroup, CAPTURE_DONE_BIT);
+  //   // get the current state from the STM
+  //   xQueuePeek(stateQueue, &cf_state3, 0);
+  // }
+}
+
+static void flash_done_cb1(void *arg);
+
+static void capture_done_cb1(void *arg)
+{
+  if (flash_offset <= flash_end + CAM_WIDTH * CAM_HEIGHT) {
+  // if (ram_buffer <= ram_buffer_end + CAM_WIDTH * CAM_HEIGHT) {
+    cpxPrintToConsole(LOG_TO_CRTP, "cdcb1\n");
+
+    // start writing to flash
+    pi_flash_program_async(&flash, flash_offset, imgBuff1, CAM_WIDTH * CAM_HEIGHT, pi_task_callback(&task1, flash_done_cb1, &task1flash)); // start writing first frame to memory
+    flash_offset += CAM_WIDTH * CAM_HEIGHT;
+    // pi_ram_write_async(&ram, ram_buffer, imgBuff1, CAM_WIDTH * CAM_HEIGHT, pi_task_callback(&task1, flash_done_cb1, &task2flash));
+    // ram_buffer += CAM_WIDTH * CAM_HEIGHT;
   }
 }
+
+static void flash_done_cb1(void *arg)
+{
+  cpxPrintToConsole(LOG_TO_CRTP, "fdcb1\n");
+
+  // start capturing a new frame
+  pi_camera_capture_async(&camera, imgBuff1, CAM_WIDTH * CAM_HEIGHT, pi_task_callback(&task1, capture_done_cb1, &task1));
+}
+
+static void flash_done_cb2(void *arg);
+
+static void capture_done_cb2(void *arg)
+{
+  if (flash_offset <= flash_end + CAM_WIDTH * CAM_HEIGHT) {
+  // if (ram_buffer <= ram_buffer_end + CAM_WIDTH * CAM_HEIGHT) {
+    cpxPrintToConsole(LOG_TO_CRTP, "cdcb2\n");
+
+    // start writing to flash
+    pi_flash_program_async(&flash, flash_offset, imgBuff2, CAM_WIDTH * CAM_HEIGHT, pi_task_callback(&task2, flash_done_cb2, &task2flash)); // start writing first frame to memory
+    flash_offset += CAM_WIDTH * CAM_HEIGHT;
+    // pi_ram_write_async(&ram, ram_buffer, imgBuff2, CAM_WIDTH * CAM_HEIGHT, pi_task_callback(&task2, flash_done_cb2, &task2flash));
+    // ram_buffer += CAM_WIDTH * CAM_HEIGHT;
+  }
+}
+
+static void flash_done_cb2(void *arg)
+{
+  cpxPrintToConsole(LOG_TO_CRTP, "fdcb2\n");
+
+  // start capturing a new frame
+  pi_camera_capture_async(&camera, imgBuff2, CAM_WIDTH * CAM_HEIGHT, pi_task_callback(&task2, capture_done_cb2, &task2));
+}
+
 
 typedef struct
 {
@@ -493,6 +561,105 @@ void camera_task(void *parameters)
   uint32_t imgSize = 0;
 
   cpxPrintToConsole(LOG_TO_CRTP, "Camera ready!\n");
+
+  /* Init & open flash. */
+  pi_hyperflash_conf_init(&flash_conf);
+  pi_open_from_conf(&flash, &flash_conf);
+  if (pi_flash_open(&flash)) {
+    cpxPrintToConsole(LOG_TO_CRTP, "Could not open flash\n");
+    return;
+  }
+
+  // /* Init & open ram. */
+  // pi_hyperram_conf_init(&ram_conf);
+  // pi_open_from_conf(&ram, &ram_conf);
+  // if (pi_ram_open(&ram)) {
+  //   cpxPrintToConsole(LOG_TO_CRTP, "Could not open HyperRAM\n");
+  //   return;
+  // }
+
+  // if (pi_ram_alloc(&ram, &ram_buffer, MAX_FLASH_STORAGE)) {
+  //   cpxPrintToConsole(LOG_TO_CRTP, "RAM alloc failed\n");
+  //   return;
+  // }
+  // ram_buffer_end = ram_buffer + MAX_FLASH_STORAGE;
+
+  struct pi_flash_info flash_info;
+  pi_flash_ioctl(&flash, PI_FLASH_IOCTL_INFO, &flash_info);
+  cpxPrintToConsole(LOG_TO_CRTP, "Flash start: %d, sector size: %d\n", flash_info.flash_start, flash_info.sector_size);
+
+  // this seems to be buggy, so use a custom flash start instead
+  flash_info.flash_start = 10 * flash_info.sector_size;
+
+  // erase some sectors for storage
+  pi_flash_erase(&flash, flash_info.flash_start, MAX_FLASH_STORAGE);
+
+  cpxPrintToConsole(LOG_TO_CRTP, "Flash erased!\n");
+
+  flash_offset = flash_info.flash_start;
+  flash_end = flash_offset + MAX_FLASH_STORAGE;
+
+  pi_camera_capture_async(&camera, imgBuff1, resolution, pi_task_callback(&task1, capture_done_cb1, &task1));
+  pi_camera_capture_async(&camera, imgBuff2, resolution, pi_task_callback(&task2, capture_done_cb2, &task2));
+  pi_camera_control(&camera, PI_CAMERA_CMD_START, 0);
+  uint32_t last_t = xTaskGetTickCount();
+  while (flash_offset <= flash_end)
+  // while (ram_buffer <= ram_buffer_end)
+  {
+    vTaskDelay(10);
+
+  }
+  pi_camera_control(&camera, PI_CAMERA_CMD_STOP, 0);
+#if 0
+  uint32_t last_t = xTaskGetTickCount();
+  uint32_t num_frames = 0;
+  while (flash_offset <= flash_end)
+  {
+    vTaskDelay(10);
+
+    pi_camera_capture_async(&camera, imgBuff1, resolution, pi_task_callback(&task1, capture_done_cb1, &task1));
+
+    pi_camera_capture_async(&camera, imgBuff1, resolution, pi_task_block(&task_1));
+    pi_camera_capture_async(&camera, imgBuff2, resolution, pi_task_block(&task_2));
+
+    pi_camera_control(&camera, PI_CAMERA_CMD_START, 0);
+    pi_task_wait_on(&task_1); // wait until first frame is captured
+    pi_flash_program_async(&flash, offset, imgBuff1, captureSize, pi_task_block(&task_1)); // start writing first frame to memory
+    offset += captureSize;
+    pi_task_wait_on(&task_2); // wait until second frame is captured
+    pi_flash_program_async(&flash, offset, imgBuff2, captureSize, pi_task_block(&task_2)); // start writing second frame to memory
+    offset += captureSize;
+
+    // xEventGroupWaitBits(evGroup, CAPTURE_DONE_BIT, pdTRUE, pdFALSE, (TickType_t)portMAX_DELAY);
+    pi_camera_control(&camera, PI_CAMERA_CMD_STOP, 0);
+
+
+    // First store information about image
+    // createImageHeaderPacket(&txp, imgSize, RAW_ENCODING, &cf_state1, captureTime1);
+    // cpxPrintToConsole(LOG_TO_CRTP, "f1 %d\n", txp.dataLength);
+    // pi_flash_program(&flash, offset, txp.data, 64);//txp.dataLength);
+    // offset += 64;//txp.dataLength;
+    // Store image
+    cpxPrintToConsole(LOG_TO_CRTP, "f2 %d\n", captureSize);
+    pi_flash_program(&flash, offset, imgBuff1, captureSize);
+
+    offset += captureSize;
+    ++num_frames;
+
+    uint32_t t = xTaskGetTickCount();
+    uint32_t dt = t - last_t;
+    if (dt > 1000) {
+      cpxPrintToConsole(LOG_TO_CRTP, "%d fps\n", num_frames);
+      last_t = t;
+      num_frames = 0;
+    }
+    cpxPrintToConsole(LOG_TO_CRTP, "t = %d\n", t);
+  }
+#endif
+  uint32_t t = xTaskGetTickCount();
+  uint32_t dt = t - last_t;
+  cpxPrintToConsole(LOG_TO_CRTP, "Flash full %d!\n", dt);
+
   while (1)
   {
     if (wifiClientConnected == 1)
