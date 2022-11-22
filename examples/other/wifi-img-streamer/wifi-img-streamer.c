@@ -125,10 +125,13 @@ typedef struct
 {
   uint8_t cmd;
   uint64_t timestamp; // usec timestamp from STM32
-  int16_t x;  // compressed [mm]
-  int16_t y;  // compressed [mm]
-  int16_t z;  // compressed [mm]
-  uint32_t quat; // compressed, see quatcompress.h
+  float x; // m
+  float y; // m
+  float z; // m
+  float qx;
+  float qy;
+  float qz;
+  float qw;
 } __attribute__((packed)) StatePacket_t;
 
 typedef struct
@@ -328,10 +331,13 @@ typedef struct
   uint8_t type;
   uint32_t size;
   uint32_t timestamp; // GAP8 clock in ms
-  int16_t x;     // compressed [mm]
-  int16_t y;     // compressed [mm]
-  int16_t z;     // compressed [mm]
-  uint32_t quat; // compressed, see quatcompress.h
+  float x; // m
+  float y; // m
+  float z; // m
+  float qx;
+  float qy;
+  float qz;
+  float qw;
 } __attribute__((packed)) img_header_t;
 
 static jpeg_encoder_t jpeg_encoder;
@@ -365,7 +371,10 @@ void createImageHeaderPacket(CPXPacket_t * packet, uint32_t imgSize, StreamerMod
   imgHeader->x = cf_state->x;
   imgHeader->y = cf_state->y;
   imgHeader->z = cf_state->z;
-  imgHeader->quat = cf_state->quat;
+  imgHeader->qx = cf_state->qx;
+  imgHeader->qy = cf_state->qy;
+  imgHeader->qz = cf_state->qz;
+  imgHeader->qw = cf_state->qw;
 
   packet->dataLength = sizeof(img_header_t);
 }
