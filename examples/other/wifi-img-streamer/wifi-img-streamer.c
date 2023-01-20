@@ -57,7 +57,6 @@ static EventGroupHandle_t evGroup;
 
 // Performance menasuring variables
 static uint32_t start = 0;
-static uint32_t stmStart = 0;
 static uint32_t captureTime1 = 0;
 static uint32_t captureTime2 = 0;
 static uint32_t captureTime3 = 0;
@@ -132,7 +131,24 @@ typedef struct
   float qy;
   float qz;
   float qw;
-} __attribute__((packed)) StatePacket_t;
+} __attribute__((packed)) StatePacketSTM_t;
+
+typedef struct
+{
+  // NEEDS TO BE IN SYNC WITH StatePacketSTM!
+  uint8_t cmd;
+  uint64_t timestamp; // usec timestamp from STM32
+  float x; // m
+  float y; // m
+  float z; // m
+  float qx;
+  float qy;
+  float qz;
+  float qw;
+
+  // this is for local use only
+  uint32_t timestamp_gap8;
+} __attribute__((packed)) StatePacketAugmented_t;
 
 typedef struct
 {
@@ -144,9 +160,9 @@ typedef struct
 } __attribute__((packed)) RegisterPacket_t;
 
 
-static StatePacket_t cf_state1;
-static StatePacket_t cf_state2;
-static StatePacket_t cf_state3;
+static StatePacketAugmented_t cf_state1;
+static StatePacketAugmented_t cf_state2;
+static StatePacketAugmented_t cf_state3;
 
 static QueueHandle_t stateQueue;
 
@@ -226,7 +242,6 @@ void rx_task_app(void *parameters)
 static uint8_t uart_buffer[50];
 void uart_rx_task(void *parameters)
 {
-  uint64_t last_timestamp = 0;
   bool synchronized = false;
 
   while (1)
@@ -259,32 +274,22 @@ void uart_rx_task(void *parameters)
         }
       }
     } else {
-      if (0 == pi_uart_read(&uart, uart_buffer, 2+sizeof(StatePacket_t)+1)) {
-        if (uart_buffer[0] == 0xBC && uart_buffer[1] == sizeof(StatePacket_t)) {
+      if (0 == pi_uart_read(&uart, uart_buffer, 2+sizeof(StatePacketSTM_t)+1)) {
+        if (uart_buffer[0] == 0xBC && uart_buffer[1] == sizeof(StatePacketSTM_t)) {
           // compute crc
           uint8_t crc = 0;
-          for (const uint8_t* p = uart_buffer + 2; p < uart_buffer+2+sizeof(StatePacket_t); p++) {
+          for (const uint8_t* p = uart_buffer + 2; p < uart_buffer+2+sizeof(StatePacketSTM_t); p++) {
             crc ^= *p;
           }
           // verify crc
-          if (uart_buffer[2+sizeof(StatePacket_t)] == crc) {
+          if (uart_buffer[2+sizeof(StatePacketSTM_t)] == crc) {
 
-            const StatePacket_t* cf_state = (const StatePacket_t*)&uart_buffer[2];
+            // Note that the buffer is actually big enough here to add the augmented state directly to it
+            StatePacketAugmented_t* cf_state = (StatePacketAugmented_t*)&uart_buffer[2];
+            cf_state->timestamp_gap8 = xTaskGetTickCount();
 
-            // put the state in the thread-safe queue
+            // copy and put the state in the thread-safe queue
             xQueueOverwrite(stateQueue, cf_state);
-
-            // Detect a clock synchronization event:
-            // The clock on the STM was synchronized (== reset to 0) using a broadcast
-            // if the current timestamp is smaller than the previous timestamp, since
-            // timestamps can only increment otherwise.
-            if (last_timestamp == 0 || cf_state->timestamp < last_timestamp) {
-              stmStart = xTaskGetTickCount();
-              cpxPrintToConsole(LOG_TO_CRTP, "TimeSync %u %u\n", (unsigned int)cf_state->timestamp, (unsigned int)last_timestamp);
-
-            }
-            last_timestamp = cf_state->timestamp;
-
 
           } else {
             synchronized = false;
@@ -305,17 +310,17 @@ void uart_rx_task(void *parameters)
 static void capture_done_cb(void *arg)
 {
   if (arg == &task1) {
-    captureTime1 = xTaskGetTickCount() - stmStart;
+    captureTime1 = xTaskGetTickCount();
     // get the current state from the STM
     xQueuePeek(stateQueue, &cf_state1, 0);
   }
   if (arg == &task2) {
-    captureTime2 = xTaskGetTickCount() - stmStart;
+    captureTime2 = xTaskGetTickCount();
     // get the current state from the STM
     xQueuePeek(stateQueue, &cf_state2, 0);
   }
   if (arg == &task3) {
-    captureTime3 = xTaskGetTickCount() - stmStart;
+    captureTime3 = xTaskGetTickCount();
     xEventGroupSetBits(evGroup, CAPTURE_DONE_BIT);
     // get the current state from the STM
     xQueuePeek(stateQueue, &cf_state3, 0);
@@ -359,7 +364,7 @@ static StreamerMode_t streamerMode = RAW_ENCODING;
 
 static CPXPacket_t txp;
 
-void createImageHeaderPacket(CPXPacket_t * packet, uint32_t imgSize, StreamerMode_t imgType, const StatePacket_t* cf_state, uint32_t captureTime) {
+void createImageHeaderPacket(CPXPacket_t * packet, uint32_t imgSize, StreamerMode_t imgType, const StatePacketAugmented_t* cf_state, uint32_t captureTime) {
   img_header_t *imgHeader = (img_header_t *) packet->data;
   imgHeader->magic = 0xBC;
   imgHeader->width = CAM_WIDTH;
@@ -367,7 +372,10 @@ void createImageHeaderPacket(CPXPacket_t * packet, uint32_t imgSize, StreamerMod
   imgHeader->depth = 1;
   imgHeader->type = imgType;
   imgHeader->size = imgSize;
-  imgHeader->timestamp = captureTime;
+  // the timestamp is the one from STM, plus the delta from the GAP8, in milliseconds
+  uint32_t stm_ms = cf_state->timestamp / 1000;
+  uint32_t delta_ms = captureTime - cf_state->timestamp_gap8;
+  imgHeader->timestamp = stm_ms + delta_ms;
   imgHeader->x = cf_state->x;
   imgHeader->y = cf_state->y;
   imgHeader->z = cf_state->z;
@@ -643,7 +651,7 @@ void start_example(void)
   evGroup = xEventGroupCreate();
 
   // Queue that stores the latest state received from the STM
-  stateQueue = xQueueCreate(1, sizeof(StatePacket_t));
+  stateQueue = xQueueCreate(1, sizeof(StatePacketAugmented_t));
 
   BaseType_t xTask;
 
