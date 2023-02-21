@@ -49,6 +49,8 @@ static pi_task_t task3;
 static unsigned char *imgBuff3;
 static pi_buffer_t buffer3;
 
+static unsigned char num_consecutive_images = 3;
+
 static struct pi_device camera;
 static struct pi_device uart;
 
@@ -157,6 +159,7 @@ typedef struct
     uint8_t aGain;
     uint8_t dGain;
     uint16_t exposure;
+    uint8_t num_consecutive_images;
 } __attribute__((packed)) RegisterPacket_t;
 
 
@@ -235,6 +238,8 @@ void rx_task_app(void *parameters)
 
       // This is needed for the camera to actually update its registers.
       set_register(0x0104, 0x1);
+
+      num_consecutive_images = regs->num_consecutive_images;
     }
   }
 }
@@ -311,17 +316,25 @@ static void capture_done_cb(void *arg)
 {
   if (arg == &task1) {
     captureTime1 = xTaskGetTickCount();
+    if (num_consecutive_images == 1) {
+      xEventGroupSetBits(evGroup, CAPTURE_DONE_BIT);
+    }
     // get the current state from the STM
     xQueuePeek(stateQueue, &cf_state1, 0);
   }
   if (arg == &task2) {
     captureTime2 = xTaskGetTickCount();
+    if (num_consecutive_images == 2) {
+      xEventGroupSetBits(evGroup, CAPTURE_DONE_BIT);
+    }
     // get the current state from the STM
     xQueuePeek(stateQueue, &cf_state2, 0);
   }
   if (arg == &task3) {
     captureTime3 = xTaskGetTickCount();
-    xEventGroupSetBits(evGroup, CAPTURE_DONE_BIT);
+    if (num_consecutive_images == 3) {
+      xEventGroupSetBits(evGroup, CAPTURE_DONE_BIT);
+    }
     // get the current state from the STM
     xQueuePeek(stateQueue, &cf_state3, 0);
   }
@@ -525,8 +538,12 @@ void camera_task(void *parameters)
 
       start = xTaskGetTickCount();
       pi_camera_capture_async(&camera, imgBuff1, resolution, pi_task_callback(&task1, capture_done_cb, &task1));
-      pi_camera_capture_async(&camera, imgBuff2, resolution, pi_task_callback(&task2, capture_done_cb, &task2));
-      pi_camera_capture_async(&camera, imgBuff3, resolution, pi_task_callback(&task3, capture_done_cb, &task3));
+      if (num_consecutive_images > 1) {
+        pi_camera_capture_async(&camera, imgBuff2, resolution, pi_task_callback(&task2, capture_done_cb, &task2));
+      }
+      if (num_consecutive_images > 2) {
+        pi_camera_capture_async(&camera, imgBuff3, resolution, pi_task_callback(&task3, capture_done_cb, &task3));
+      }
 
       pi_camera_control(&camera, PI_CAMERA_CMD_START, 0);
       xEventGroupWaitBits(evGroup, CAPTURE_DONE_BIT, pdTRUE, pdFALSE, (TickType_t)portMAX_DELAY);
@@ -577,24 +594,26 @@ void camera_task(void *parameters)
         transferTime = xTaskGetTickCount() - start;
 
         // second buffer
+        if (num_consecutive_images > 1) {
+          // First send information about the image
+          createImageHeaderPacket(&txp, imgSize, RAW_ENCODING, &cf_state2, captureTime2);
+          cpxSendPacketBlocking(&txp);
 
-        // First send information about the image
-        createImageHeaderPacket(&txp, imgSize, RAW_ENCODING, &cf_state2, captureTime2);
-        cpxSendPacketBlocking(&txp);
-
-        // Send image
-        sendBufferViaCPX(&txp, imgBuff2, imgSize);
-        transferTime = xTaskGetTickCount() - start;
+          // Send image
+          sendBufferViaCPX(&txp, imgBuff2, imgSize);
+          transferTime = xTaskGetTickCount() - start;
+        }
 
         // third buffer 
+        if (num_consecutive_images > 2) {
+          // First send information about the image
+          createImageHeaderPacket(&txp, imgSize, RAW_ENCODING, &cf_state3, captureTime3);
+          cpxSendPacketBlocking(&txp);
 
-        // First send information about the image
-        createImageHeaderPacket(&txp, imgSize, RAW_ENCODING, &cf_state3, captureTime3);
-        cpxSendPacketBlocking(&txp);
-
-        // Send image
-        sendBufferViaCPX(&txp, imgBuff3, imgSize);
-        transferTime = xTaskGetTickCount() - start;
+          // Send image
+          sendBufferViaCPX(&txp, imgBuff3, imgSize);
+          transferTime = xTaskGetTickCount() - start;
+        }
       }
 #ifdef OUTPUT_PROFILING_DATA
       cpxPrintToConsole(LOG_TO_CRTP, "capture=%dms, encoding=%d ms (%d bytes), transfer=%d ms\n",
