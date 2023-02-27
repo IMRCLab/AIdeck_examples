@@ -39,6 +39,12 @@
 // #define CAM_HEIGHT 244
 #define CAM_HEIGHT 324
 
+typedef enum
+{
+  RAW_ENCODING = 0,
+  JPEG_ENCODING = 1
+} __attribute__((packed)) StreamerMode_t;
+
 static pi_task_t task1;
 static unsigned char *imgBuff1;
 static pi_buffer_t buffer1;
@@ -50,6 +56,7 @@ static unsigned char *imgBuff3;
 static pi_buffer_t buffer3;
 
 static unsigned char num_consecutive_images = 3;
+static StreamerMode_t streamerMode = RAW_ENCODING;
 
 static struct pi_device camera;
 static struct pi_device uart;
@@ -160,6 +167,7 @@ typedef struct
     uint8_t dGain;
     uint16_t exposure;
     uint8_t num_consecutive_images;
+    uint8_t streamer_mode;
 } __attribute__((packed)) RegisterPacket_t;
 
 
@@ -240,6 +248,7 @@ void rx_task_app(void *parameters)
       set_register(0x0104, 0x1);
 
       num_consecutive_images = regs->num_consecutive_images;
+      streamerMode = (StreamerMode_t)regs->streamer_mode;
     }
   }
 }
@@ -360,11 +369,7 @@ typedef struct
 
 static jpeg_encoder_t jpeg_encoder;
 
-typedef enum
-{
-  RAW_ENCODING = 0,
-  JPEG_ENCODING = 1
-} __attribute__((packed)) StreamerMode_t;
+
 
 pi_buffer_t header;
 uint32_t headerSize;
@@ -373,7 +378,7 @@ uint32_t footerSize;
 pi_buffer_t jpeg_data;
 uint32_t jpegSize;
 
-static StreamerMode_t streamerMode = RAW_ENCODING;
+
 
 static CPXPacket_t txp;
 
@@ -564,7 +569,6 @@ void camera_task(void *parameters)
         createImageHeaderPacket(&txp, imgSize, JPEG_ENCODING, &cf_state1, captureTime1);
         cpxSendPacketBlocking(&txp);
 
-        start = xTaskGetTickCount();
         // First send header
         memcpy(txp.data, header.data, headerSize);
         txp.dataLength = headerSize;
@@ -577,6 +581,52 @@ void camera_task(void *parameters)
         memcpy(txp.data, footer.data, footerSize);
         txp.dataLength = footerSize;
         cpxSendPacketBlocking(&txp);
+
+        // second buffer
+        if (num_consecutive_images > 1) {
+          jpeg_encoder_process(&jpeg_encoder, &buffer2, &jpeg_data, &jpegSize);
+
+          imgSize = headerSize + jpegSize + footerSize;
+
+          // First send information about the image
+          createImageHeaderPacket(&txp, imgSize, JPEG_ENCODING, &cf_state2, captureTime2);
+          cpxSendPacketBlocking(&txp);
+
+          // First send header
+          memcpy(txp.data, header.data, headerSize);
+          txp.dataLength = headerSize;
+          cpxSendPacketBlocking(&txp);
+          
+          // Send image data
+          sendBufferViaCPX(&txp, (uint8_t*) jpeg_data.data, jpegSize);
+
+          // Send footer
+          memcpy(txp.data, footer.data, footerSize);
+          txp.dataLength = footerSize;
+          cpxSendPacketBlocking(&txp);
+        }
+        if (num_consecutive_images > 2) {
+          jpeg_encoder_process(&jpeg_encoder, &buffer3, &jpeg_data, &jpegSize);
+
+          imgSize = headerSize + jpegSize + footerSize;
+
+          // First send information about the image
+          createImageHeaderPacket(&txp, imgSize, JPEG_ENCODING, &cf_state3, captureTime3);
+          cpxSendPacketBlocking(&txp);
+
+          // First send header
+          memcpy(txp.data, header.data, headerSize);
+          txp.dataLength = headerSize;
+          cpxSendPacketBlocking(&txp);
+          
+          // Send image data
+          sendBufferViaCPX(&txp, (uint8_t*) jpeg_data.data, jpegSize);
+
+          // Send footer
+          memcpy(txp.data, footer.data, footerSize);
+          txp.dataLength = footerSize;
+          cpxSendPacketBlocking(&txp);
+        }
 
         transferTime = xTaskGetTickCount() - start;
       }
